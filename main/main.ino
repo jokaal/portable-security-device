@@ -5,10 +5,10 @@
 #define PIR 2
 #define MODEM_TX 5
 #define MODEM_RX 6
-#define DIVG 7
+#define DIVG 7. // make low for measuring battery voltage, high for minimal power waste
 #define BATTERY_VOLTAGE A0
 #define USB_VOLTAGE A1
-#define CURRENT A2
+#define CURRENT A2 // only on one board for development
 #define LED 13
 
 volatile int16_t adc[9];
@@ -42,9 +42,12 @@ void setup() {
   digitalWrite(LED,0);
 
   TCCR1A=0x00;
-  TCCR1B=0x04; // prescaler to 256
+  TCCR1B=0x04; // prescaler to 256. // 16000000 / 256 / 65536 = 0.953 Hz
   TIMSK1=1;  // enable overflow interrupts
-  
+
+  wdt_enable(WDTO_1S);
+  set_sleep_mode(SLEEP_MODE_IDLE); // SLEEP_MODE_IDLE);  
+
 }
 
 ISR(WDT_vect) 
@@ -76,11 +79,9 @@ ISR(TIMER1_OVF_vect)
 
 
 void loop() {
-    wdt_enable(WDTO_1S);
-    WDTCSR|=(1<<WDIE);
-    set_sleep_mode(SLEEP_MODE_IDLE); // SLEEP_MODE_IDLE);  
     sleep_mode();
-    wdt_reset();
+    wdt_reset(); // watchdog timer
+    WDTCSR|=(1<<WDIE);
     if (tick!=ltick) {
       ltick=tick;
       if (!adc_complete)
@@ -90,7 +91,7 @@ void loop() {
 
       digitalWrite(DIVG, HIGH);
       Serial.print("Battery:");
-      Serial.print(adc[0]*1.1/1023*((22+7.5)/7.5));
+      Serial.print(adc[0]*1.1/1023*((22+7.5)/7.5)); // 1.1V referents pinge, 1023 resolutsioon, pingejaguri jagamistegur
       Serial.print(" ");
 
       Serial.print("Supply:");
