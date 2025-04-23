@@ -3,7 +3,7 @@
 #include <avrserial.hpp>
 #include <sim800.hpp>
 
-#define PHONE_NUMBER "+37253640486"
+#define PHONE_NUMBER ""
 #define SIM_PIN "0000"
 
 #define MAX_MESSAGES 64 // in cache
