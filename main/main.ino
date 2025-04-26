@@ -3,10 +3,14 @@
 #include <avrserial.hpp>
 #include <sim800.hpp>
 
+#define COUNTOF(x) (sizeof(x)/sizeof(x[0]))
+
 #define PHONE_NUMBER ""
 #define SIM_PIN "0000"
 
-#define MAX_MESSAGES 64 // in cache
+#define MAX_MESSAGES 50 // in cache
+
+enum { MOTION_DETECTED = 10, BATTERY_CRITICAL = 20, BATTERY_LOW = 21, BATTERY_NOT_CRITICAL = 22, BATTERY_CHARGING = 23 };
 
 #define MODEM_TX 6
 #define MODEM_RX 5
@@ -19,43 +23,47 @@
 #define CURRENT A2 // only on one board for development
 #define LED 13
 
-#define INTER_DELAY 250
-#define SWITCH_DELAY 10000 // delay when switch is turned on in ms
-#define PIR_DELAY 60000 // delay between each notification in ms
+#define INTER_DELAY 50/10
+#define SWITCH_DELAY 10000/10 // delay when switch is turned on in 10 ms ticks
+#define PIR_DELAY 60000/10 // delay between each notification in 10 ms ticks
+#define ADC_DELAY 100/10 // ADC sampling interval in 10 ms ticks
+#define SECOND_DELAY 1000/10
 
-unsigned long prevMillis;
-int time_count = 0;
+// these counters are counted down in timer interrupt
+// with 10 ms interval
+uint16_t pir_timer = INTER_DELAY;
+uint16_t switch_timer = SWITCH_DELAY;
+uint16_t notification_timer = PIR_DELAY;
+uint16_t adc_timer = ADC_DELAY;
+uint16_t second_timer = SECOND_DELAY;
+
+SIM800::MODEMSTATE oldstate=SIM800::M_NONE;
+
+uint8_t motion_detected;
+uint8_t last_pir_state;
+
 int sample_array[8];
-int i = 0;
-int pirStateCurrent = 0;
-int pirStatePrev = 0;
+int pirStateCurrent;
+int pirStatePrev;
 
 volatile int16_t adc[9];
 volatile uint8_t adc_complete;
-volatile uint8_t tick;
 volatile uint8_t pir_state;
 volatile uint8_t switch_state;
 volatile uint8_t nsamples;
-uint8_t ltick;
 
 bool lowMsgSent = false; // battery low
 bool criticalMsgSent = false; // battery critical
-
-unsigned long lastMotionTime = 0;
 bool pirArmed = false;
-unsigned long switchOnTime = 0;
-
 uint16_t bitcount;
-uint8_t modem_tick;
-
 DateTime syncedTime;
 bool startCount = false;
 
-// FIFO
+// message FIFO
 DateTime message_cache[MAX_MESSAGES];
-uint8_t messageHead = 0;
-uint8_t messageTail = 0;
-uint8_t pendingMessages = 0;
+uint8_t messageHead;
+uint8_t messageTail;
+uint8_t pendingMessages;
 
 UART uart;
 
@@ -133,6 +141,16 @@ class : public SIM800
 
 } modem;
 
+void set_timer(uint16_t& timer,uint16_t ms)
+{
+  timer=ms;
+}
+
+bool expired(uint16_t timer)
+{
+  return !timer;
+}
+
 void adc_start()
 {
   digitalWrite(DIVG, LOW);
@@ -144,9 +162,10 @@ void adc_start()
 
 void sample()
 {
+static uint8_t i=0;
   sample_array[i] = digitalRead(PIR);
   i++;
-  if(i > 8){
+  if(i >= COUNTOF(sample_array)){
     i = 0;
   }
 }
@@ -168,8 +187,6 @@ int readPIR(int pirState)
   return pirStateCurrent && !(pirStatePrev);
 }
 
-volatile uint32_t secondsCounter = 0;
-
 // Combined timer interrupt for both modem and PIR sensor
 ISR(TIMER1_OVF_vect)
 {
@@ -178,49 +195,19 @@ ISR(TIMER1_OVF_vect)
   modem.run();
   uart.run();
   bitcount++;
-  if (bitcount==9600) {
-    modem_tick=1;
+  if (bitcount==96) {
     bitcount=0;   
-
-    if (startCount) {
-      // Count seconds (9600Hz / 9600 = 1Hz)
-      secondsCounter++;
-      if(secondsCounter % 1 == 0) { // Every second
-        syncedTime.second++;
-        if(syncedTime.second >= 60) {
-          syncedTime.second = 0;
-          syncedTime.minute++;
-          if(syncedTime.minute >= 60) {
-            syncedTime.minute = 0;
-            syncedTime.hour++;
-            if(syncedTime.hour >= 24) {
-              syncedTime.hour = 0;
-              syncedTime.day++;
-              // Simple month handling (no leap years)
-              uint8_t daysInMonth = 31;
-              if(syncedTime.month == 4 || syncedTime.month == 6 || syncedTime.month == 9 || syncedTime.month == 11) {
-                daysInMonth = 30;
-              } else if(syncedTime.month == 2) {
-                daysInMonth = 28;
-              }
-              
-              if(syncedTime.day > daysInMonth) {
-                syncedTime.day = 1;
-                syncedTime.month++;
-                if(syncedTime.month > 12) {
-                  syncedTime.month = 1;
-                  syncedTime.year++;
-                }
-              }
-            }
-          }
-        }
-      }
-    }
+    if (pir_timer)
+      pir_timer--;
+    if (switch_timer)
+      switch_timer--;
+    if (notification_timer)
+      notification_timer--;
+    if (adc_timer)
+      adc_timer--;
+    if (second_timer)
+      second_timer--;
   }
-  
-  // PIR sensor tick
-  tick++;
 }
 
 ISR(WDT_vect) 
@@ -230,7 +217,7 @@ ISR(WDT_vect)
 ISR(ADC_vect)
 {
   uint8_t ch=ADMUX&15;
-  adc[ch]=ADC;
+  adc[ch]=ADC; // (adc[ch]+adc[ch]+adc[ch]+ADC)>>2; // 0.75*old+0.25*new
   ch+=1;
   if (ch>8)
     ch=0;
@@ -245,53 +232,12 @@ ISR(ADC_vect)
   }
 }
 
-void setup() {
-  MCUSR = 0;
-  wdt_enable(WDTO_4S);
-  
-  pinMode(SWITCH, INPUT_PULLUP);
-  pinMode(PIR, INPUT);
-  pinMode(MODEM_TX,OUTPUT);
-  pinMode(MODEM_RX,INPUT);
-  pinMode(MODEM_RESET,OUTPUT);
-  pinMode(DIVG,OUTPUT);
-  pinMode(LED,OUTPUT);
-  digitalWrite(LED,0);
-
-  // configure hardware UART for 9600 bps
-  UBRR0H=((F_CPU/(16UL*9600))-1)>>8;
-  UBRR0L=((F_CPU/(16UL*9600))-1)&0xff;
-  UCSR0B=(1<<RXCIE0)|(1<<RXEN0)|(1<<TXEN0); // enable rx,tx, enable rx int
-  
-  // set up timer interrupts for 9600 hz 
-  TCCR1A=0x00;
-  TCCR1B=0x01;
-  TCNT1=0xffff-1600;
-  TIMSK1=1;
-
-  uart.printf("Initializing system\r\n");
-  modem.reset();
-  uart.printf("Ready\r\n");
-
-  //wdt_enable(WDTO_1S);
-  //set_sleep_mode(SLEEP_MODE_IDLE);
-}
-
-SIM800::MODEMSTATE oldstate=SIM800::M_NONE;
-uint8_t motion_detected = 0;
-uint8_t last_pir_state = 0;
-
-// Have a premade FIFO class in case needed for EEPROM
-//FIFO<DateTime,60> mcache;
-//syncedTime.dow=msg;
-//mchache.push(syncedTime);
-
 void queueMessage(uint8_t msg) {
   if (pendingMessages >= MAX_MESSAGES) {
     uart.printf("Message queue full!\r\n");
     return;
   }
-
+  uart.printf("Adding message %d to queue\r\n",(int16_t)msg);
   message_cache[messageHead] = syncedTime;
   message_cache[messageHead].dow = msg; // currently using unused 'dow' variable in DateTime for messages, should probably rename this
 
@@ -343,19 +289,30 @@ void processMessageQueue() {
         DateTime current = message_cache[messageTail];
         char msg[200];
 
+
         switch (current.dow) {
-          case 10: // Motion detected message
+          case MOTION_DETECTED: // Motion detected message
             createMessage(msg, "Motion detected!");
             modem.send_sms(PHONE_NUMBER, msg);
             sendingMessage = true;
             break;
-          case 20: // Battery critical message
+          case BATTERY_CRITICAL: // Battery critical message
             createMessage(msg, "Battery critically low!");
             modem.send_sms(PHONE_NUMBER, msg);
             sendingMessage = true;
             break;
-          case 21: // Battery low message
+          case BATTERY_LOW: // Battery low message
             createMessage(msg, "Battery getting low!");
+            modem.send_sms(PHONE_NUMBER, msg);
+            sendingMessage = true;
+            break;
+          case BATTERY_CHARGING:
+            createMessage(msg, "Battery is charging");
+            modem.send_sms(PHONE_NUMBER, msg);
+            sendingMessage = true;
+            break;
+          case BATTERY_NOT_CRITICAL:
+            createMessage(msg, "Battery no longer critically low");
             modem.send_sms(PHONE_NUMBER, msg);
             sendingMessage = true;
             break;
@@ -363,8 +320,6 @@ void processMessageQueue() {
             uart.printf("ERROR: UNKNOWN MESSAGE TYPE IN QUEUE!\r\n");
             break;
         }
-
-
     }
   }
 }
@@ -398,55 +353,8 @@ void createMessage(char* outStr, const char* text) {
                usbStr);
 }
 
-void loop() {
-
-  //const uint32_t armingInterval = 10000; //ms
-  //const uint32_t rearmingInterval = 60000; //ms
-  //uint32_t now = millis();
-  
-  //sleep_mode();
-  wdt_reset(); // watchdog timer
-  WDTCSR|=(1<<WDIE);
-  
-  switch_state = digitalRead(SWITCH);
-  digitalWrite(LED,switch_state);
-
-  unsigned long currMillis = millis();
-
-  // Handle PIR arming delay when switch is turned on
-  if (switch_state && !pirArmed) {
-      if (switchOnTime == 0) {
-          switchOnTime = currMillis;
-          uart.printf("Switch turned on, waiting %d ms to arm PIR\r\n", SWITCH_DELAY);
-      } else if (currMillis - switchOnTime >= SWITCH_DELAY) {
-          pirArmed = true;
-          uart.printf("PIR sensor now armed\r\n");
-      }
-  } else if (!switch_state) {
-      pirArmed = false;
-      motion_detected = 0;
-      switchOnTime = 0;
-      lastMotionTime = 0;
-  }
-
-  //unsigned long currMillis = millis();
-  if(currMillis - prevMillis >= INTER_DELAY) {
-    prevMillis = currMillis;
-    sample();
-  }
-
-  modem.get_response();
-  if (modem_tick) {
-    modem_tick=0;
-    modem.pulse();
-    adc_start();
-  }
-  
-  if (oldstate!=modem.get_state()) {
-    oldstate=modem.get_state();
-    uart.printf("Modem state: %d\r\n",oldstate);
-  }
-
+void check_battery()
+{
   if (adc_complete) {
     digitalWrite(DIVG, HIGH); // disconnect voltage divider
 
@@ -454,49 +362,213 @@ void loop() {
     float bat_voltage = adc[0]*1.1/1023*((22+7.5)/7.5);
     float usb_voltage = adc[1]*1.1/1023*((22+5.1)/5.1);
 
+    uart.printf("%d:%d:%d bat: %d usb: %d low: %d critical: %d pending messages: %d\r\n",syncedTime.hour,syncedTime.minute,syncedTime.second,
+      (int)(bat_voltage*1000),(int)(usb_voltage*1000),lowMsgSent?1:0,criticalMsgSent?1:0,pendingMessages); // debug
+
     if (usb_voltage > 4.0) { // if device is charging then don't need to send battery low messages
-      if (bat_voltage > 3.45 && criticalMsgSent) criticalMsgSent = false; // reset flag if device has been charged
-      if (bat_voltage > 3.55 && lowMsgSent) lowMsgSent = false;
-    } else {
-      if (bat_voltage < 3.45 && !criticalMsgSent) { // device stops working around 3.3 to 3.4 V
-        queueMessage(20);
-        criticalMsgSent = true;
-      } else if (bat_voltage < 3.55 && !lowMsgSent) {
-        queueMessage(21);
-        lowMsgSent = true;
+      if (bat_voltage > 3.65) {
+        if (lowMsgSent) {
+          lowMsgSent = false;
+          criticalMsgSent = false; // reset flag if device has been charged
+          queueMessage(BATTERY_CHARGING);
+        }
+      }
+      if (bat_voltage > 3.55) {
+        if (criticalMsgSent) {
+          criticalMsgSent = false; // reset flag if device has been charged
+          queueMessage(BATTERY_NOT_CRITICAL);
+        }
+      }
+    } 
+    else {
+      if (bat_voltage < 3.45) {
+        if (!criticalMsgSent) { // device stops working around 3.3 to 3.4 V
+          queueMessage(BATTERY_CRITICAL);
+          criticalMsgSent = true;
+          lowMsgSent = true;
+        }
+      }
+      if (bat_voltage < 3.55) {
+        if (!lowMsgSent) {
+          queueMessage(BATTERY_LOW);
+          lowMsgSent = true;
+        }
       }
     }
   }
-  
-  if (switch_state && pirArmed && adc_complete) {
-    
-    pir_state = readPIR(full_arr(sample_array));
+}
 
-    // Check if we're in the rearm period
-      if (lastMotionTime > 0 && (currMillis - lastMotionTime) < PIR_DELAY) {
-        // Still in rearm period, ignore motion
-        pir_state = 0;
-        motion_detected = 0;
+void count_time()
+{
+  if (startCount) {
+    // Count seconds (9600Hz / 9600 = 1Hz)
+    syncedTime.second++;
+    if(syncedTime.second >= 60) {
+      syncedTime.second = 0;
+      syncedTime.minute++;
+      if(syncedTime.minute >= 60) {
+        syncedTime.minute = 0;
+        syncedTime.hour++;
+        if(syncedTime.hour >= 24) {
+          syncedTime.hour = 0;
+          syncedTime.day++;
+          // Simple month handling (no leap years)
+          uint8_t daysInMonth = 31;
+          if(syncedTime.month == 4 || syncedTime.month == 6 || syncedTime.month == 9 || syncedTime.month == 11) {
+            daysInMonth = 30;
+          } else if(syncedTime.month == 2) {
+            daysInMonth = 28;
+          }
+          
+          if(syncedTime.day > daysInMonth) {
+            syncedTime.day = 1;
+            syncedTime.month++;
+            if(syncedTime.month > 12) {
+              syncedTime.month = 1;
+              syncedTime.year++;
+            }
+          }
+        }
       }
-    
-    // Check for motion start (rising edge)
-    if (pir_state && !motion_detected) {
-      motion_detected = 1;
-      queueMessage(10);
-      lastMotionTime = currMillis;
-      uart.printf("Motion detected, will rearm in %d ms\r\n", PIR_DELAY);
     }
-    
+  }
+}
+
+void check_switch()
+{
+  static uint8_t state=0;
+  switch_state = digitalRead(SWITCH);
+  digitalWrite(LED,switch_state);
+
+  switch (state) {
+    default:
+      state=0;
+      // fall through
+    case 0: // not armed, check for switch on
+      if (switch_state) {
+        set_timer(switch_timer,SWITCH_DELAY);
+        state=1;
+        uart.printf("Switch turned on, waiting %d ms to arm PIR\r\n",SWITCH_DELAY*10);
+      }
+      break;
+    case 1:
+      if (!switch_state) {
+        state=0;
+        break;
+      }
+      if (expired(switch_timer)) {
+        pirArmed = true;
+        set_timer(notification_timer,0);
+        motion_detected = 0;
+        uart.printf("PIR sensor now armed\r\n");
+        state=2;
+        break;
+      }
+      break;
+    case 2:
+      if (!switch_state) {
+        pirArmed = false;
+        motion_detected = 0;
+        state = 0;
+        uart.printf("PIR sensor disarmed\r\n");
+      }
+      break;
+  }
+}
+
+void check_pir()
+{
+  sample();
+  pir_state = readPIR(full_arr(sample_array));
+  if (pirArmed) {
+
+    if (!expired(notification_timer)) {
+      pir_state = 0;
+      motion_detected = 0;
+    }
+
+    if (pir_state && (!motion_detected)) {
+      motion_detected = 1;
+      queueMessage(MOTION_DETECTED);
+      set_timer(notification_timer,PIR_DELAY);
+      uart.printf("Motion detected, will rearm in %d seconds\r\n", PIR_DELAY/100);
+    }
+
     // Check for motion end (falling edge)
     if (last_pir_state && !pir_state) {
       motion_detected = 0;
       uart.printf("Motion ended. Ready for new detection after rearm period.\r\n");
     }
     
-    last_pir_state = pir_state;
+  }
+  else {
+    motion_detected = 0;
+  }
+  last_pir_state = pir_state;
+}
+
+void setup() {
+  MCUSR = 0;
+  wdt_enable(WDTO_4S);
+  
+  pinMode(SWITCH, INPUT_PULLUP);
+  pinMode(PIR, INPUT);
+  pinMode(MODEM_TX,OUTPUT);
+  pinMode(MODEM_RX,INPUT);
+  pinMode(MODEM_RESET,OUTPUT);
+  pinMode(DIVG,OUTPUT);
+  pinMode(LED,OUTPUT);
+  digitalWrite(LED,0);
+
+  // configure hardware UART for 9600 bps
+  UBRR0H=((F_CPU/(16UL*9600))-1)>>8;
+  UBRR0L=((F_CPU/(16UL*9600))-1)&0xff;
+  UCSR0B=(1<<RXCIE0)|(1<<RXEN0)|(1<<TXEN0); // enable rx,tx, enable rx int
+  
+  // set up timer interrupts for 9600 hz 
+  TCCR1A=0x00;
+  TCCR1B=0x01;
+  TCNT1=0xffff-1600;
+  TIMSK1=1;
+
+  uart.printf("Initializing system\r\n");
+  modem.reset();
+  uart.printf("Ready\r\n");
+
+  //wdt_enable(WDTO_1S);
+  //set_sleep_mode(SLEEP_MODE_IDLE);
+}
+
+void loop() {
+
+  //sleep_mode();
+  wdt_reset(); // watchdog timer
+  WDTCSR|=(1<<WDIE);
+
+  if (expired(adc_timer)) {  
+    set_timer(adc_timer,ADC_DELAY);
+    adc_start();
+    check_switch();
   }
 
-  if (pendingMessages > 0) {
-    processMessageQueue();
+  if (expired(pir_timer)) {
+    set_timer(pir_timer,INTER_DELAY);
+    check_pir();
+  }
+
+  modem.get_response();
+  
+  if (oldstate!=modem.get_state()) {
+    oldstate=modem.get_state();
+    uart.printf("Modem state: %d\r\n",oldstate);
+  }
+
+  if (expired(second_timer)) {
+    set_timer(second_timer,SECOND_DELAY);
+    check_battery();
+    modem.pulse();
+    if (pendingMessages) {
+      processMessageQueue();
+    }
   }
 }
